@@ -6,7 +6,6 @@ from . import run_ui
 def slurman_cli():
     parser = ArgumentParser("SLURM UI")
     parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument("-c", "--cluster", help="Specify the name of the cluster")
     parser.add_argument(
         "-i",
         "--interval",
@@ -24,7 +23,6 @@ def slurman_cli():
     args = parser.parse_args()
     run_ui(
         verbose=args.verbose,
-        cluster=args.cluster,
         interval=args.interval,
         history_range=args.history_range,
     )

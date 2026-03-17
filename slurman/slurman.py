@@ -46,7 +46,6 @@ def handle_error(func):
 class Slurman(App):
     # configuration that can be set from the command line
     verbose = False
-    cluster = None
     interval = 10
     history_range = "1 week"  # Default history range
 
@@ -510,7 +509,7 @@ class Slurman(App):
 
     @handle_error
     def query_jobs(self, sort_column=None, sort_ascending=True):
-        squeue_df = self.get_squeue(self.cluster, self.only_my_jobs, self.only_running_jobs) 
+        squeue_df = self.get_squeue(self.only_my_jobs, self.only_running_jobs) 
         if sort_column is not None:
             squeue_df = squeue_df.sort_values(squeue_df.columns[sort_column], ascending=sort_ascending)
 
@@ -662,7 +661,7 @@ class Slurman(App):
 
     @handle_error
     def query_gpus(self,  sort_column=None, sort_ascending=True):
-        overview_df = self.get_sinfo(self.cluster)
+        overview_df = self.get_sinfo()
         self.stats['ngpus'] = overview_df["GPUs (Total)"].sum()
         self.stats['ngpus_avail'] = overview_df["GPUs (Avail)"].sum()
         if self.only_available_nodes:
@@ -705,7 +704,7 @@ class Slurman(App):
             return "2024-11-26"
     
     @handle_error
-    def get_squeue(self, cluster=None, only_my_jobs=True, only_running_jobs=False):
+    def get_squeue(self, only_my_jobs=True, only_running_jobs=False):
         sep = "|"
         if DEBUG:
             response_string = SQUEUE_DEBUG
@@ -748,7 +747,7 @@ class Slurman(App):
         return df 
     
     @handle_error
-    def get_sinfo(self, cluster):
+    def get_sinfo(self):
         if DEBUG:
             response_string = SINFO_DEBUG
         else:
@@ -777,7 +776,7 @@ class Slurman(App):
             # overview_df = overview_df[['Partition', 'Host', "Device", "State", "Mem (GB)", "CPUs", "GPUs", "Free IDX", "Feature"]]
 
             if row[1]['GRES'] != "(null)":
-                device, ngpus = self.parse_gres(row[1]['GRES'], cluster)
+                device, ngpus = self.parse_gres(row[1]['GRES'])
             else:
                 continue
             
@@ -785,7 +784,7 @@ class Slurman(App):
             if not node_available:
                 gpu_avail_idx = []
             else:
-                device, gpu_avail_idx = self.parse_gres_used(row[1]['GRES_USED'], ngpus, cluster)
+                device, gpu_avail_idx = self.parse_gres_used(row[1]['GRES_USED'], ngpus)
             ngpus_avail = len(gpu_avail_idx)
 
             host_info = OrderedDict()
@@ -837,7 +836,7 @@ class Slurman(App):
         return overview_df
     
     @handle_error
-    def parse_gres(self, gres_str, cluster=None):
+    def parse_gres(self, gres_str):
         match = re.match(r"([^:]+)(?::([^:()]+))?:([^:(,]+)(?:\(S:([^)]+)\))?", gres_str)
 
         if match:
@@ -853,7 +852,7 @@ class Slurman(App):
         return device, ngpus
 
     @handle_error
-    def parse_gres_used(self, gres_used_str, num_total, cluster=None):
+    def parse_gres_used(self, gres_used_str, num_total):
         match = re.match(r"([^:]+)(?::([^:]+))?:([^:(,]+)(?:\(IDX:([^)]+)\))?", gres_used_str)
         if match:
             groups = match.groups()
@@ -943,14 +942,13 @@ def read_log(fn, num_lines=100):
     
     return txt_lines
 
-def run_ui(verbose=False, cluster=None, interval=10, history_range="1 week"):
+def run_ui(verbose=False, interval=10, history_range="1 week"):
     # if debug:
     #     # global for quick debugging
     #     global DEBUG
     #     DEBUG = True
     app = Slurman()
     app.verbose = verbose
-    app.cluster = cluster
     app.interval = interval
     app.history_range = history_range
     app.run()

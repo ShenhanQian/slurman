@@ -1,6 +1,6 @@
 # Slurman
 
-Enhanced command-line UI to ease working with Slurm.
+Enhanced command-line GUI to ease working with Slurm.
 Written in Python, derived from [SlurmUI](https://github.com/SirWyver/slurmui).
 
 Viewing and managing
@@ -10,7 +10,7 @@ Viewing and managing
 - Jobs in the queue
 - Logs for current and past jobs
 
-![Slurman demo](asset/demo.png)
+![Slurman demo](https://raw.githubusercontent.com/ShenhanQian/slurmui/main/asset/demo.png)
 
 ## Install and run
 
@@ -21,10 +21,9 @@ slurman
 
 Optional arguments:
 
-- `-i` update interval in seconds. (10 by default. Set to 0 to disable).
+- `-h` show help message and exit.
+- `-i` refreshing interval in seconds. (10 by default. Set to 0 to disable).
 - `-v` verbose mode (printing info and error to the info panel).
-- `-r` time range of history jobs to load (1 week by default).
-- `-c` cluster name (deprecated as the latest version of Slurman does not have cluster-specific configuration).
 
 ## Basics
 
@@ -38,9 +37,9 @@ Make sure you can get meaningful output from these commands on your cluster befo
 
 To debug, you could run `slurman -i 0 -v` to disable auto update and force verbose logging. Then you will see the full commands that Slurman sends to Slurm in the info panel.
 
-![Verbose info panel](asset/verbose_info.png)
+![Verbose info panel](https://raw.githubusercontent.com/ShenhanQian/slurmui/main/asset/verbose_info.png)
 
-## Supported Clusters
+## Tested Clusters
 
 - [TUM CVG](https://cvg.cit.tum.de/)
 - [TUM VCG](https://www.niessnerlab.org/)
