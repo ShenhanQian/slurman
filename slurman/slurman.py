@@ -385,6 +385,7 @@ class Slurman(App):
             log_fn = self._get_log_fn(job_id)
             assert os.path.exists(log_fn), f"Log file not found: {log_fn}"
             self.STAGE.update({"action": "job_log", "log_fn": log_fn})
+            self.job_log_position = None
             self.update_log(log_fn)
             self.switch_display("job_log")
         self.refresh_bindings()
@@ -636,19 +637,23 @@ class Slurman(App):
         self.job_log.border_title = f"{log_fn}"
         current_scroll_y = self.job_log.scroll_offset[1]
 
-        if not self.job_log_position:
-            with open(log_fn, 'r') as f:
-                self.job_log_position = max(sum(len(line) for line in f) - 2**12, 0)  # read the last 4KB
-            
-            with open(log_fn, 'r') as log_file:
+        # Read logs in binary mode so non-UTF8 bytes don't crash decoding.
+        with open(log_fn, "rb") as log_file:
+            if self.job_log_position is None:
+                file_size = os.path.getsize(log_fn)
+                self.job_log_position = max(file_size - 2**15, 0)  # read the last 4KB
                 log_file.seek(self.job_log_position)
-                new_lines = log_file.readlines()[1:]  # drop the first line because it can be incomplete
-                self.job_log_position = log_file.tell()
-        else:
-            with open(log_fn, 'r') as log_file:
+                new_data = log_file.read()
+                if self.job_log_position > 0:
+                    first_newline = new_data.find(b"\n")
+                    if first_newline != -1:
+                        new_data = new_data[first_newline + 1:]
+            else:
                 log_file.seek(self.job_log_position)
-                new_lines = log_file.readlines()
-                self.job_log_position = log_file.tell()
+                new_data = log_file.read()
+            self.job_log_position = log_file.tell()
+
+        new_lines = new_data.decode("utf-8", errors="replace").splitlines(keepends=True)
 
         update_scroll = current_scroll_y == self.job_log.max_scroll_y
         
