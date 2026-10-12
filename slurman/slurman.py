@@ -104,6 +104,7 @@ class Slurman(App):
         Binding("s", "sort", "Sort"),
         Binding("d", "delete", "Delete"),
         Binding("G", "print_gpustat", "GPU"),
+        Binding("S", "open_shell", "Shell"),
         Binding("l", "display_job_log", "Log"),
         Binding("L", "open_with_less", "Open with less"),
         Binding("J", "toggle_user_range", "State"),
@@ -189,6 +190,8 @@ class Slurman(App):
         elif action == "delete" and self.STAGE['action'] not in ['job', 'select']:
             return False
         elif action == "print_gpustat" and self.STAGE['action'] != 'job':
+            return False
+        elif action == "open_shell" and self.STAGE['action'] != 'job':
             return False
         elif action == "display_job_log" and self.STAGE['action'] not in ['job', 'history']:
             return False
@@ -375,8 +378,23 @@ class Slurman(App):
     def action_print_gpustat(self):
         if self.STAGE["action"] == "job":
             job_id = self._get_selected_job()
-            gpustat = subprocess.check_output(f"""srun --jobid {job_id} gpustat""", shell=True, timeout=3).decode("utf-8").rstrip()
+            gpustat = subprocess.check_output(f"""srun --jobid {job_id} --overlap gpustat""", shell=True, timeout=3).decode("utf-8").rstrip()
             self.info_log.write(gpustat)
+
+    @handle_error
+    def action_open_shell(self):
+        if self.STAGE["action"] == "job":
+            job_id = self._get_selected_job()
+            shell = os.environ.get("SHELL", "bash")
+            with self.suspend():
+                # Ignore SIGINT in slurman, but let the shell receive it
+                original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                try:
+                    subprocess.run(['srun', '--jobid', str(job_id), '--overlap', '--pty', shell],
+                                   preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+                finally:
+                    signal.signal(signal.SIGINT, original_sigint)
+            self.refresh()
     
     @handle_error
     def action_display_job_log(self):
