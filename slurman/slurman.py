@@ -1,39 +1,56 @@
-from collections import OrderedDict
 import io
 import importlib.metadata
+import os
+import re
+import signal
+import socket
+import subprocess
+import threading
+import time
+import traceback
+from datetime import datetime, timedelta
+from functools import wraps
+
+import pandas as pd
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Footer, RichLog, DataTable, Tabs, Tab
 from textual.containers import Container
-from rich.text import Text
-import subprocess
-import pandas as pd
-import re
-import os
-import threading
-import traceback
-from functools import wraps
-from datetime import datetime, timedelta
-import time
-import socket
-import signal
-
-
-DEBUG = False
-if DEBUG:
-    from slurman.debug_strings import SINFO_DEBUG, SQUEUE_DEBUG
+from textual.widgets import Header, Footer, RichLog, DataTable, Tabs, Tab
 
 
 ERROR_LOG_PATH = os.path.expanduser("~/.slurman_error.log")
 ERROR_LOG_LOCK = threading.Lock()
+HOSTNAME = socket.gethostname()
+
+TABLES = ("job", "node", "history")
+HISTORY_RANGES = {"1 week": 7, "1 month": 30, "4 months": 120, "1 year": 365}
+
+# stages in which each action is allowed (actions not listed are always allowed)
+ACTION_STAGES = {
+    "display_nodes": TABLES,
+    "display_history_jobs": TABLES,
+    "display_jobs": TABLES,
+    "select": ("job", "select"),
+    "select_inverse": ("job", "select"),
+    "refresh": (*TABLES, "job_log"),
+    "confirm": ("delete",),
+    "sort": TABLES,
+    "delete": ("job", "select"),
+    "print_gpustat": ("job",),
+    "open_shell": ("job",),
+    "display_job_log": ("job", "history"),
+    "open_with_less": ("job", "job_log", "history"),
+    "toggle_user_range": ("job",),
+    "toggle_history_range": ("history",),
+}
 
 
 def run_in_thread(func):
     """Decorator to run a function in a separate thread"""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        thread = threading.Thread(target=func, args=args, kwargs=kwargs)
-        thread.start()
+        threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True).start()
     return wrapper
 
 def handle_error(func):
@@ -59,35 +76,11 @@ class Slurman(App):
     # configuration that can be set from the command line
     verbose = False
     interval = 10
-    history_range = "1 week"  # Default history range
-
-    # internal states
-    STAGE = {
-        "action": "job",
-        "job": {
-            # "sort_column": 0,
-            # "sort_ascending": True,
-        },
-        "history": {
-            "sort_column": 0,
-            "sort_ascending": False,
-        },
-        "node": {
-            # "sort_column": 0,
-            # "sort_ascending": True,
-        },
-    }
-    stats = {}
-    selected_jobid = []
-    only_available_nodes = True
-    only_completed_history = False
-    only_running_jobs = False
-    only_my_jobs = True
+    history_range = "1 week"
 
     theme = "textual-dark"
     selected_text_style = "bold on orange3"
-    border_type = "solid"
-    border_color = "white"
+    border = ("solid", "white")
 
     CSS_PATH = "slurman.tcss"
     TITLE = f"Slurman (v{importlib.metadata.version('slurman')})"
@@ -111,10 +104,23 @@ class Slurman(App):
         Binding("H", "toggle_history_range", "Range"),
     ]
 
-    def compose(self) -> ComposeResult:
-        self.header = Header()
-        self.footer = Footer()
+    def __init__(self):
+        super().__init__()
+        # internal states
+        self.STAGE = {
+            "action": "job",
+            "job": {},
+            "history": {"sort_column": 0, "sort_ascending": False},
+            "node": {},
+        }
+        self.stats = {}
+        self.selected_jobid = []
+        self.only_available_nodes = True
+        self.only_completed_history = False
+        self.only_running_jobs = False
+        self.only_my_jobs = True
 
+    def compose(self) -> ComposeResult:
         self.tab_nodes = Tab("GPUs", id="node")
         self.tab_history = Tab("History", id="history")
         self.tab_jobs = Tab("Jobs", id="job")
@@ -122,36 +128,25 @@ class Slurman(App):
         self.tabs = Tabs(self.tab_nodes, self.tab_history, self.tab_jobs, self.tab_time, id="tabs")
         self.tabs.can_focus = False
 
-        self.node_table = DataTable(id="node_table")
-        self.job_table = DataTable(id="job_table")
-        self.history_table = DataTable(id="history_table")
-        self.tables = {
-            "job": self.job_table,
-            "node": self.node_table,
-            "history": self.history_table
-        }
+        self.tables = {name: DataTable(id=f"{name}_table") for name in TABLES}
         self.active_table = "job"
 
         self.info_log = RichLog(wrap=True, highlight=True, id="info_log", auto_scroll=True)
         self.info_log.can_focus = False
         self.info_log.border_title = "Info"
-        
-        self.job_log = RichLog(wrap=True, highlight=True, id="job_log", auto_scroll=False)
-        self.job_log_position = None
-        
-        
-        yield self.header
-        yield self.tabs
-        yield Container(self.job_table, self.node_table, self.history_table, self.info_log, self.job_log)
-        yield self.footer
 
-    def on_mount(self):
-        pass
+        self.job_log = RichLog(wrap=True, highlight=True, id="job_log", auto_scroll=False)
+        self.job_log.styles.border = self.border
+        self.job_log_position = None
+
+        yield Header()
+        yield self.tabs
+        yield Container(*self.tables.values(), self.info_log, self.job_log)
+        yield Footer()
 
     def on_ready(self) -> None:
-        self.rewrite_table("job")
-        self.rewrite_table("node")
-        self.rewrite_table("history")
+        for name in TABLES:
+            self.rewrite_table(name)
         self.tabs.active = 'job'
         if self.interval > 0:
             self.set_interval(self.interval, self.auto_refresh)
@@ -161,107 +156,62 @@ class Slurman(App):
         if self.verbose:
             self.info_log.write(f"Tab activated: {tab_id}")
 
-        self.STAGE.update({"action": tab_id})
+        self.STAGE["action"] = tab_id
         self.update_table(tab_id)
         self.switch_display(tab_id)
         self.refresh_bindings()
-        
-    @handle_error
-    def check_action(self, action: str, parameters):  
+
+    def check_action(self, action: str, parameters):
         """Check if an action may run."""
-        if action == "display_nodes" and self.STAGE['action'] not in ['node', 'history', 'job']:
-            return False
-        elif action == "display_history_jobs" and self.STAGE['action'] not in ['node', 'history', 'job']:
-            return False
-        elif action == "display_jobs" and self.STAGE['action'] not in ['node', 'history', 'job']:
-            return False
-        elif action == "abort":
-            pass
-        elif action == "select" and self.STAGE['action'] not in ['job', 'select']:
-            return False
-        elif action == "select_inverse" and self.STAGE['action'] not in ['job', 'select']:
-            return False
-        elif action == "refresh" and self.STAGE['action'] not in ['job', 'history', 'node', 'job_log']:
-            return False
-        elif action == "confirm" and self.STAGE['action'] != 'delete':
-            return False
-        elif action == "sort" and self.STAGE['action'] not in ['job', 'history', 'node']:
-            return False
-        elif action == "delete" and self.STAGE['action'] not in ['job', 'select']:
-            return False
-        elif action == "print_gpustat" and self.STAGE['action'] != 'job':
-            return False
-        elif action == "open_shell" and self.STAGE['action'] != 'job':
-            return False
-        elif action == "display_job_log" and self.STAGE['action'] not in ['job', 'history']:
-            return False
-        elif action == "open_with_less" and self.STAGE['action'] not in ['job', 'job_log', 'history']:
-            return False
-        elif action == "toggle_user_range" and self.STAGE['action'] != 'job':
-            return False
-        elif action == "toggle_history_range" and self.STAGE['action'] != 'history':
-            return False
-        return True
+        stages = ACTION_STAGES.get(action)
+        return stages is None or self.STAGE["action"] in stages
+
+    def _display_tab(self, tab, toggle):
+        """Switch to `tab`, or flip its filter via `toggle` if it is already shown."""
+        if self.STAGE[self.active_table].get('updating'):
+            return
+        if self.STAGE["action"] == tab:
+            toggle()
+            self.rewrite_table(tab, keep_state=True)
+            self.switch_display(tab)
+        else:
+            self.STAGE["action"] = tab
+            self.update_table(tab)
+            self.tabs.active = tab
+        self.refresh_bindings()
 
     @handle_error
     def action_display_nodes(self):
-        if self.STAGE[self.active_table]['updating']:
-            return
-        if self.STAGE["action"] in ["history", "job"]:
-            self.STAGE.update({"action": "node"})
-            self.update_table("node")
-            self.refresh_bindings()
-            self.tabs.active = "node"
-        elif self.STAGE["action"] == "node":
+        def toggle():
             self.only_available_nodes = not self.only_available_nodes
-            self.rewrite_table("node", keep_state=True)
-            self.switch_display("node")
+        self._display_tab("node", toggle)
 
     @handle_error
     def action_display_history_jobs(self):
-        if self.STAGE[self.active_table]['updating']:
-            return
-        if self.STAGE["action"] in ["node", "job"]:
-            self.STAGE.update({"action": "history"})
-            self.update_table("history")
-            self.refresh_bindings()
-            self.tabs.active = "history"
-        elif self.STAGE["action"] == "history":
+        def toggle():
             self.only_completed_history = not self.only_completed_history
-            self.rewrite_table("history", keep_state=True)
-            self.switch_display("history")
-    
+        self._display_tab("history", toggle)
+
     @handle_error
     def action_display_jobs(self):
-        if self.STAGE[self.active_table]['updating']:
-            return
-        if self.STAGE["action"] in ["node", "history"]:
-            self.STAGE.update({"action": "job"})
-            self.update_table("job")
-            self.refresh_bindings()
-            self.tabs.active = "job"
-        elif self.STAGE["action"] == "job":
+        def toggle():
             self.only_running_jobs = not self.only_running_jobs
-            self.rewrite_table("job", keep_state=True)
-            self.refresh_bindings()
-            self.switch_display("job")
+        self._display_tab("job", toggle)
 
     @handle_error
     def action_abort(self):
-        if self.STAGE["action"] == "delete":
+        action = self.STAGE["action"]
+        if action == "delete":
             self.info_log.write("Delete: aborted")
             self.selected_jobid = []
             self.STAGE.pop("job_id", None)
-            self.STAGE.pop("job_name", None)
-        elif self.STAGE["action"] == "job_log":
+        elif action == "job_log":
             self.job_log_position = None
-            self.STAGE.pop("job_id", None)
-            self.STAGE.pop("job_name", None)
             self.STAGE.pop("log_fn", None)
-        elif self.STAGE["action"] == "select":
+        elif action == "select":
             self.info_log.write("Select: none")
             self.selected_jobid = []
-        elif self.STAGE["action"] in ["node", "history"]:
+        elif action in ["node", "history"]:
             self.tabs.active = "job"
         action = self.tabs.active
         self.STAGE['action'] = action
@@ -269,187 +219,149 @@ class Slurman(App):
         self.switch_display(action)
         self.refresh()
 
-    @handle_error
-    def action_select(self):
-        if (self.STAGE["action"] == "job" and not self.selected_jobid) or self.STAGE["action"] == "select":
-            i = self.tables[self.active_table].cursor_coordinate[0]
-            value = str(self.tables[self.active_table].get_cell_at((i, 0)))
+    def _toggle_selection(self, row, job_id):
+        table = self.tables[self.active_table]
+        if job_id in self.selected_jobid:
+            self.selected_jobid.remove(job_id)
+            table.update_cell_at((row, 0), job_id)
+            return False
+        self.selected_jobid.append(job_id)
+        table.update_cell_at((row, 0), Text(job_id, style=self.selected_text_style))
+        return True
 
-            job_id = self._get_selected_job()
-            if job_id in self.selected_jobid:
-                self.selected_jobid.remove(job_id)
-                self.tables[self.active_table].update_cell_at((i, 0), value)
-            else:
-                self.selected_jobid.append(job_id)
-                self.tables[self.active_table].update_cell_at((i, 0), Text(str(value), style=self.selected_text_style))
-            
-            if self.selected_jobid:
-                self.STAGE["action"] = "select"
-                self.info_log.write(f"Select: {' '.join(self.selected_jobid)}")
-            else:
-                self.STAGE["action"] = "job"
-                self.info_log.write(f"Select: none")
-            self.tables[self.active_table].action_cursor_down()
-        self.refresh_bindings()  
-   
-    @handle_error
-    def action_select_inverse(self):
-        assert self.STAGE["action"] in ["job", "select"]
-        for i in range(len(self.tables[self.active_table].rows)):
-            job_id = str(self.tables[self.active_table].get_cell_at((i, 0)))
-            
-            if job_id in self.selected_jobid:
-                self.selected_jobid.remove(job_id)
-                self.tables[self.active_table].update_cell_at((i, 0), job_id)
-            else:
-                self.selected_jobid.append(job_id)
-                self.tables[self.active_table].update_cell_at((i, 0), Text(str(job_id), style=self.selected_text_style))
-                self.tables[self.active_table].move_cursor(row=i, column=0)
+    def _report_selection(self):
         if self.selected_jobid:
             self.STAGE["action"] = "select"
             self.info_log.write(f"Select: {' '.join(self.selected_jobid)}")
         else:
             self.STAGE["action"] = "job"
-            self.info_log.write(f"Select: none")
-        self.refresh_bindings()  
-    
+            self.info_log.write("Select: none")
+        self.refresh_bindings()
+
+    @handle_error
+    def action_select(self):
+        if self.STAGE["action"] == "job" and self.selected_jobid:
+            return
+        table = self.tables[self.active_table]
+        self._toggle_selection(table.cursor_row, self._get_selected_job())
+        self._report_selection()
+        table.action_cursor_down()
+
+    @handle_error
+    def action_select_inverse(self):
+        table = self.tables[self.active_table]
+        for i in range(table.row_count):
+            if self._toggle_selection(i, str(table.get_cell_at((i, 0)))):
+                table.move_cursor(row=i, column=0)
+        self._report_selection()
+
     @run_in_thread
     @handle_error
     def auto_refresh(self):
         if self.verbose:
             self.info_log.write("Auto-refreshing...")
-        if self.STAGE["action"] == "job":
-            self.update_table("job")
-        elif self.STAGE["action"] == "job_log":
+        action = self.STAGE["action"]
+        if action in ["job", "node"]:
+            self.update_table(action)
+        elif action == "job_log":
             self.update_log(self.STAGE["log_fn"])
-        elif self.STAGE["action"] == "node":
-            self.update_table("node")
-        # elif self.STAGE["action"] == "history":
-        #     self.update_table("history")
         self.update_status()
 
     @handle_error
     def action_refresh(self):
-        if self.STAGE["action"] == "job":
-            self.rewrite_table("job", keep_state=True)
-        elif self.STAGE["action"] == "job_log":
+        action = self.STAGE["action"]
+        if action == "job_log":
             self.update_log(self.STAGE["log_fn"])
-        elif self.STAGE["action"] == "node":
-            self.rewrite_table("node", keep_state=True)
-        elif self.STAGE["action"] == "history":
-            self.rewrite_table("history", keep_state=True)
+        else:
+            self.rewrite_table(action, keep_state=True)
         self.update_status()
-    
+
     @handle_error
     def action_confirm(self):
-        # job to delete
-        if self.STAGE["action"] == "delete":
-            perform_scancel(self.STAGE['job_id'])
-            self.info_log.write(f"Delete: {self.STAGE['job_id']}? succeeded")
-            self.selected_jobid = []
-            self.update_table("job")
-            self.STAGE["action"] = "job"
+        result = subprocess.run(["scancel", *self.STAGE["job_id"].split()])
+        self.info_log.write(f"Delete: {self.STAGE['job_id']}? {'succeeded' if result.returncode == 0 else 'failed'}")
+        self.selected_jobid = []
+        self.update_table("job")
+        self.STAGE["action"] = "job"
         self.refresh_bindings()
 
     @handle_error
     def action_sort(self):
+        stage = self.STAGE[self.STAGE["action"]]
         sort_column = self.tables[self.active_table].cursor_column
-        if sort_column != self.STAGE[self.STAGE["action"]].get("sort_column"):
-            self.STAGE[self.STAGE["action"]]["sort_ascending"] = False
+        if sort_column != stage.get("sort_column"):
+            stage["sort_ascending"] = False
         else:
-            self.STAGE[self.STAGE["action"]]["sort_ascending"] = not self.STAGE[self.STAGE["action"]].get("sort_ascending", True)
-        self.STAGE[self.STAGE["action"]]['sort_column'] = sort_column
+            stage["sort_ascending"] = not stage.get("sort_ascending", True)
+        stage['sort_column'] = sort_column
 
         self.rewrite_table(self.active_table, keep_state=True)
         self.tables[self.active_table].move_cursor(row=0, column=sort_column)
-    
+
     @handle_error
     def action_delete(self):
         if self.STAGE["action"] == "job":
             job_id = self._get_selected_job()
-            self.info_log.write(f"Delete: {job_id}? press <<ENTER>> to confirm")
-            self.STAGE.update({"action": "delete", "job_id": job_id})
-        elif self.STAGE["action"] == "select":
-            self.info_log.write(f"Delete: {' '.join(self.selected_jobid)}? press <<ENTER>> to confirm")
-            self.STAGE.update({"action": "delete", "job_id": ' '.join(self.selected_jobid)})
-        self.refresh_bindings()  
+        else:
+            job_id = ' '.join(self.selected_jobid)
+        self.info_log.write(f"Delete: {job_id}? press <<ENTER>> to confirm")
+        self.STAGE.update({"action": "delete", "job_id": job_id})
+        self.refresh_bindings()
 
     @handle_error
     def action_print_gpustat(self):
-        if self.STAGE["action"] == "job":
-            job_id = self._get_selected_job()
-            gpustat = subprocess.check_output(f"""srun --jobid {job_id} --overlap gpustat""", shell=True, timeout=3).decode("utf-8").rstrip()
-            self.info_log.write(gpustat)
+        job_id = self._get_selected_job()
+        gpustat = subprocess.check_output(["srun", "--jobid", job_id, "--overlap", "gpustat"], timeout=3, text=True)
+        self.info_log.write(gpustat.rstrip())
+
+    def _run_suspended(self, cmd):
+        """Run an interactive command in the terminal while the UI is suspended."""
+        with self.suspend():
+            # Ignore SIGINT in slurman, but let the command receive it
+            original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                subprocess.run(cmd, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            finally:
+                signal.signal(signal.SIGINT, original_sigint)
+        self.refresh()
 
     @handle_error
     def action_open_shell(self):
-        if self.STAGE["action"] == "job":
-            job_id = self._get_selected_job()
-            shell = os.environ.get("SHELL", "bash")
-            with self.suspend():
-                # Ignore SIGINT in slurman, but let the shell receive it
-                original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-                try:
-                    subprocess.run(['srun', '--jobid', str(job_id), '--overlap', '--pty', shell],
-                                   preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
-                finally:
-                    signal.signal(signal.SIGINT, original_sigint)
-            self.refresh()
-    
+        job_id = self._get_selected_job()
+        self._run_suspended(["srun", "--jobid", job_id, "--overlap", "--pty", os.environ.get("SHELL", "bash")])
+
     @handle_error
     def action_display_job_log(self):
-        if self.STAGE["action"] in ["job", "history"]:
-            job_id = self._get_selected_job()
-            log_fn = self._get_log_fn(job_id)
-            assert os.path.exists(log_fn), f"Log file not found: {log_fn}"
-            self.STAGE.update({"action": "job_log", "log_fn": log_fn})
-            self.job_log_position = None
-            self.update_log(log_fn)
-            self.switch_display("job_log")
+        log_fn = self._get_log_fn(self._get_selected_job())
+        assert os.path.exists(log_fn), f"Log file not found: {log_fn}"
+        self.STAGE.update({"action": "job_log", "log_fn": log_fn})
+        self.job_log_position = None
+        self.update_log(log_fn)
+        self.switch_display("job_log")
         self.refresh_bindings()
-    
+
     @handle_error
     def action_open_with_less(self):
-        if self.STAGE["action"] in ["job", "job_log", "history"]:
-            if 'log_fn' not in self.STAGE:
-                job_id = self._get_selected_job()
-                log_fn = self._get_log_fn(job_id)
-            else:
-                log_fn = self.STAGE['log_fn']
-            assert os.path.exists(log_fn), f"Log file not found: {log_fn}"
-            with self.suspend():
-                # Save the current SIGINT handler
-                original_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
-                try:
-                    subprocess.run(['less', '+G', log_fn])
-                finally:
-                    # Restore the original SIGINT handler
-                    signal.signal(signal.SIGINT, original_sigint)
-            self.refresh()
-    
+        log_fn = self.STAGE.get("log_fn") or self._get_log_fn(self._get_selected_job())
+        assert os.path.exists(log_fn), f"Log file not found: {log_fn}"
+        self._run_suspended(['less', '+G', log_fn])
+
     @handle_error
     def action_toggle_user_range(self):
-        if self.STAGE["action"] == "job":
-            self.only_my_jobs = not self.only_my_jobs
-            self.rewrite_table("job", keep_state=True)
-            self.refresh_bindings()
-            self.switch_display("job")
+        self.only_my_jobs = not self.only_my_jobs
+        self.rewrite_table("job", keep_state=True)
+        self.switch_display("job")
 
     @handle_error
     def action_toggle_history_range(self):
-        if self.STAGE[self.active_table]['updating']:
+        if self.STAGE[self.active_table].get('updating'):
             return
-        if self.history_range == "1 week":
-            self.history_range = "1 month"
-        elif self.history_range == "1 month":
-            self.history_range = "4 months"
-        elif self.history_range == "4 months":
-            self.history_range = "1 year"
-        else:
-            self.history_range = "1 week"
+        ranges = list(HISTORY_RANGES)
+        idx = ranges.index(self.history_range) + 1 if self.history_range in ranges else 0
+        self.history_range = ranges[idx % len(ranges)]
         self.rewrite_table("history", keep_state=True)
         self.switch_display("history")
-    
+
     def print_tab_prompt(self, tab_id):
         if not self.verbose:
             self.info_log.clear()
@@ -459,7 +371,7 @@ class Slurman(App):
         elif tab_id == "history":
             info = f"Press 'h' to toggle job states: {'Completed' if self.only_completed_history else 'All'}\t| " \
             + f"Press 'H' to toggle history range: {self.history_range}"
-        elif tab_id == "job":
+        else:
             info = f"Press 'j' to toggle job states: {'Running' if self.only_running_jobs else 'All'}\t|" \
             + f" Press 'J' to toggle user range: {'Me' if self.only_my_jobs else 'All'}"
         self.info_log.write(info)
@@ -467,521 +379,284 @@ class Slurman(App):
     def switch_display(self, action):
         if self.verbose:
             self.info_log.write(f"Switch display: {action}")
-        if action == "node":
-            self.node_table.styles.height = "80%"
-            self.active_table = action
-            self.tables[self.active_table].focus()
-            self.info_log.styles.height="20%"
-            self.info_log.styles.border = (self.border_type, self.border_color)
-            self.print_tab_prompt(action)
-        
-            self.job_table.styles.height = "0%"
-            self.history_table.styles.height = "0%"
-            self.job_log.styles.height="0%"
-            self.job_log.styles.border = (self.border_type, self.border_color)
-            self.job_log.clear()
-        elif action == "history":
-            self.history_table.styles.height = "80%"
-            self.active_table = action
-            self.tables[self.active_table].focus()
-            self.info_log.styles.height="20%"
-            self.info_log.styles.border = (self.border_type, self.border_color)
-            self.print_tab_prompt(action)
-
-            self.job_table.styles.height = "0%"
-            self.node_table.styles.height = "0%"
-            self.job_log.styles.height="0%"
-            self.job_log.styles.border = (self.border_type, self.border_color)
-            self.job_log.clear()
-        elif action == "job":
-            self.job_table.styles.height = "80%"
-            self.active_table = action
-            self.tables[self.active_table].focus()
-            self.info_log.styles.border = (self.border_type, self.border_color)
-            self.info_log.styles.height="20%"
-            self.print_tab_prompt(action)
-
-            self.history_table.styles.height = "0%"
-            self.node_table.styles.height = "0%"
-            self.job_log.styles.border = (self.border_type, self.border_color)
-            self.job_log.styles.height="0%"
-            self.job_log.clear()
-        elif action == "job_log":
-            self.job_log.styles.height="100%"
-            self.job_log.styles.border = (self.border_type, self.border_color)
+        if action == "job_log":
+            for table in self.tables.values():
+                table.styles.height = "0%"
+            self.info_log.styles.height = "0%"
+            self.info_log.styles.border = ("none", self.border[1])
+            self.job_log.styles.height = "100%"
             self.job_log.focus()
-            
-            self.job_table.styles.height="0%"
-            self.node_table.styles.height="0%"
-            self.history_table.styles.height="0%"
-            self.info_log.styles.height="0%"
-            self.info_log.styles.border = ("none", self.border_color)
+        elif action in TABLES:
+            for name, table in self.tables.items():
+                table.styles.height = "80%" if name == action else "0%"
+            self.active_table = action
+            self.tables[action].focus()
+            self.info_log.styles.height = "20%"
+            self.info_log.styles.border = self.border
+            self.print_tab_prompt(action)
+            self.job_log.styles.height = "0%"
+            self.job_log.clear()
         else:
             raise ValueError(f"Invalid action: {action}")
 
-    @run_in_thread
     @handle_error
     def update_status(self):
-        self.title = f"Slurman (v{importlib.metadata.version('slurman')})"
+        stats = self.stats
+        self.tab_jobs.label = f"Jobs: {stats.get('njobs_running', 0)}/{stats.get('njobs', 0)}"
+        self.tab_nodes.label = f"GPUs: {stats.get('ngpus_avail', 0)}/{stats.get('ngpus', 0)}"
+        self.tab_history.label = f"History: {stats.get('nhistory_completed', 0)}/{stats.get('nhistory', 0)}"
+        self.tab_time.label = f"{HOSTNAME} | {datetime.now().strftime('%H:%M:%S')}"
 
-        njobs = self.stats.get("njobs", 0)
-        njobs_running = self.stats.get("njobs_running", 0)
-        self.tab_jobs.label = f"Jobs: {njobs_running}/{njobs}"
-
-        ngpus_avail = self.stats.get("ngpus_avail", 0)
-        ngpus = self.stats.get("ngpus", 0)
-        self.tab_nodes.label = f"GPUs: {ngpus_avail}/{ngpus}"
-
-        nhistory = self.stats.get("nhistory", 0)
-        nhistory_completed = self.stats.get("nhistory_completed", 0)
-        self.tab_history.label = f"History: {nhistory_completed}/{nhistory}"
-        
-        self.tab_time.label = f"{socket.gethostname()} | {datetime.now().strftime('%H:%M:%S')}"
-
-    @handle_error
-    def query_jobs(self, sort_column=None, sort_ascending=True):
-        squeue_df = self.get_squeue(self.only_my_jobs, self.only_running_jobs) 
-        if sort_column is not None:
-            squeue_df = squeue_df.sort_values(squeue_df.columns[sort_column], ascending=sort_ascending)
-
-        self.stats['njobs'] = len(squeue_df)
-        self.stats['njobs_running'] = sum(1 for row in squeue_df.iterrows() if row[1]['STATE'] == 'RUNNING')
-        return squeue_df
+    def _fetch_rows(self, table_type):
+        """Query the data of a table and return its columns and rows as strings."""
+        stage = self.STAGE[table_type]
+        query = {"job": self.query_jobs, "node": self.query_gpus, "history": self.query_history}[table_type]
+        df = query()
+        if stage.get("sort_column") is not None:
+            df = df.sort_values(df.columns[stage["sort_column"]], ascending=stage.get("sort_ascending", True))
+        self.update_status()
+        return list(df.columns), df.astype(str).values.tolist()
 
     @run_in_thread
     @handle_error
     def rewrite_table(self, table_type, keep_state=False):
-        if table_type not in self.STAGE:
-            self.STAGE[table_type] = {}
-        if self.STAGE[table_type].get('updating', False):
+        stage = self.STAGE[table_type]
+        if stage.get('updating'):
             return
-        self.STAGE[table_type]['updating'] = True
+        stage['updating'] = True
+        try:
+            columns, rows = self._fetch_rows(table_type)
 
-        if 'sort_column' in self.STAGE[table_type]:
-            sort_column = self.STAGE[table_type]['sort_column']
-        else:
-            sort_column = None
-        if 'sort_ascending' in self.STAGE[table_type]:
-            sort_ascending = self.STAGE[table_type]['sort_ascending']
-        else:
-            sort_ascending = True
-
-        df = self.query_table_data(table_type, sort_column, sort_ascending)
-        self.update_status()
-
-        table = self.tables[table_type]
-        if keep_state:
-            cursor_column = table.cursor_column
-            cursor_row = table.cursor_row
-        else:
-            cursor_column = 0
-            cursor_row = 0
-
-        table.clear(columns=True)
-        table.add_columns(*df.columns)
-        
-        for _, row in df.iterrows():
-            table_row = [str(row[col]) for col in df.columns]
-            table.add_row(*table_row)
-
-        cursor_row = min(cursor_row, len(table.rows) - 1)
-        cursor_column = min(cursor_column, len(table.columns) - 1)
-        table.move_cursor(row=cursor_row, column=cursor_column)
-
-        time.sleep(0.3)
-        self.STAGE[table_type]['updating'] = False
+            table = self.tables[table_type]
+            cursor_row, cursor_column = (table.cursor_row, table.cursor_column) if keep_state else (0, 0)
+            table.clear(columns=True)
+            table.add_columns(*columns)
+            table.add_rows(rows)
+            table.move_cursor(row=min(cursor_row, len(rows) - 1), column=min(cursor_column, len(columns) - 1))
+            time.sleep(0.3)
+        finally:
+            stage['updating'] = False
 
     @run_in_thread
     @handle_error
     def update_table(self, table_type):
-        if self.STAGE[table_type].get('updating', False):
+        stage = self.STAGE[table_type]
+        if stage.get('updating'):
             return
-        self.STAGE[table_type]['updating'] = True
-        if 'sort_column' in self.STAGE[table_type]:
-            sort_column = self.STAGE[table_type]['sort_column']
-        else:
-            sort_column = None
-        if 'sort_ascending' in self.STAGE[table_type]:
-            sort_ascending = self.STAGE[table_type]['sort_ascending']
-        else:
-            sort_ascending = True
+        stage['updating'] = True
+        try:
+            columns, rows = self._fetch_rows(table_type)
 
-        df = self.query_table_data(table_type, sort_column, sort_ascending)
-        self.update_status()
+            table = self.tables[table_type]
+            if len(table.columns) != len(columns):
+                table.clear(columns=True)
+                table.add_columns(*columns)
 
-        table = self.tables[table_type]
-        if not table.columns:
-            table.add_columns(*df.columns)
-            for _, row in df.iterrows():
-                table_row = [str(row[col]) for col in df.columns]
-                table.add_row(*table_row)
-            return
-
-        for row_index, (_, row) in enumerate(df.iterrows()):
-            table_row = [str(row[col]) for col in df.columns]
-            if row_index < len(table.rows):
-                for col_index, cell in enumerate(table_row):
+            for row_index, row in enumerate(rows[:table.row_count]):
+                for col_index, cell in enumerate(row):
                     if table.get_cell_at((row_index, col_index)) != cell:
                         table.update_cell_at((row_index, col_index), cell)
-            else:
-                table.add_row(*table_row)
+            table.add_rows(rows[table.row_count:])
 
-        while len(table.rows) > len(df):
-            row_key, _ = table.coordinate_to_cell_key((len(table.rows) - 1, 0))
-            table.remove_row(row_key)
+            while table.row_count > len(rows):
+                row_key, _ = table.coordinate_to_cell_key((table.row_count - 1, 0))
+                table.remove_row(row_key)
+        finally:
+            stage['updating'] = False
 
-        self.STAGE[table_type]['updating'] = False
-
-    @handle_error
-    def query_table_data(self, table_type, sort_column=None, sort_ascending=True):
-        if table_type == "job":
-            return self.query_jobs(sort_column, sort_ascending)
-        elif table_type == "node":
-            return self.query_gpus(sort_column, sort_ascending)
-        elif table_type == "history":
-            return self.query_history(sort_column, sort_ascending)
-        else:
-            raise ValueError(f"Invalid table type: {table_type}")
-
-    @handle_error
     def _get_selected_job(self):
-        row_idx = self.tables[self.active_table].cursor_row
-        row = self.tables[self.active_table].get_row_at(row_idx)
-        job_id = str(row[0])
-        return job_id
+        table = self.tables[self.active_table]
+        return str(table.get_row_at(table.cursor_row)[0])
 
     @handle_error
     def update_log(self, log_fn):
-        self.job_log.border_title = f"{log_fn}"
-        current_scroll_y = self.job_log.scroll_offset[1]
+        self.job_log.border_title = log_fn
+        follow = self.job_log.scroll_offset.y == self.job_log.max_scroll_y
 
         # Read logs in binary mode so non-UTF8 bytes don't crash decoding.
         with open(log_fn, "rb") as log_file:
             if self.job_log_position is None:
-                file_size = os.path.getsize(log_fn)
-                self.job_log_position = max(file_size - 2**15, 0)  # read the last 4KB
-                log_file.seek(self.job_log_position)
+                # start with the last 32KB, beginning from a full line
+                start = max(os.path.getsize(log_fn) - 2**15, 0)
+                log_file.seek(start)
                 new_data = log_file.read()
-                if self.job_log_position > 0:
-                    first_newline = new_data.find(b"\n")
-                    if first_newline != -1:
-                        new_data = new_data[first_newline + 1:]
+                if start > 0:
+                    new_data = new_data[new_data.find(b"\n") + 1:]
             else:
                 log_file.seek(self.job_log_position)
                 new_data = log_file.read()
             self.job_log_position = log_file.tell()
 
-        new_lines = new_data.decode("utf-8", errors="replace").splitlines(keepends=True)
-
-        update_scroll = current_scroll_y == self.job_log.max_scroll_y
-        
-        for line in new_lines:
+        for line in new_data.decode("utf-8", errors="replace").splitlines(keepends=True):
             self.job_log.write(line)
-
-        if update_scroll:
+        if follow:
             self.job_log.scroll_end(animate=False)
-    
-    @handle_error
+
     def _get_log_fn(self, job_id):
         if self.STAGE["action"] == "history":
-            response_string = subprocess.check_output(f"""sacct -j {job_id} --format=StdOut -P""", shell=True).decode("utf-8")
-            formatted_string = response_string.split("\n")[1].strip()
-            formatted_string = formatted_string.replace("%j", job_id)
-        elif self.STAGE["action"] in ["job", "job_log"]:
-            response_string = subprocess.check_output(f"""scontrol show job {job_id} | grep StdOut""", shell=True).decode("utf-8")
-            formatted_string = response_string.split("=")[-1].strip()
-        else:
-            raise ValueError(f"Cannot get log file for action: {self.STAGE['action']}")
-        return formatted_string
+            output = self._run(["sacct", "-j", job_id, "--format=StdOut", "-P"])
+            return output.split("\n")[1].strip().replace("%j", job_id)
+        output = self._run(["scontrol", "show", "job", job_id])
+        match = re.search(r"StdOut=(\S+)", output)
+        assert match, f"StdOut not found for job {job_id}"
+        return match.group(1)
 
-    @handle_error
-    def query_gpus(self,  sort_column=None, sort_ascending=True):
-        overview_df = self.get_sinfo()
-        self.stats['ngpus'] = overview_df["GPUs (Total)"].sum()
-        self.stats['ngpus_avail'] = overview_df["GPUs (Avail)"].sum()
+    def _run(self, cmd):
+        """Run a slurm command and return its output."""
+        if self.verbose:
+            self.info_log.write(" ".join(cmd))
+        return subprocess.check_output(cmd, text=True)
+
+    def query_jobs(self):
+        df = self.get_squeue()
+        self.stats['njobs'] = len(df)
+        self.stats['njobs_running'] = int((df['STATE'] == 'RUNNING').sum())
+        return df
+
+    def query_gpus(self):
+        df = self.get_sinfo()
+        self.stats['ngpus'] = int(df["GPUs (Total)"].sum())
+        self.stats['ngpus_avail'] = int(df["GPUs (Avail)"].sum())
         if self.only_available_nodes:
-            # filter out nodes with no available GPUs
-            overview_df = overview_df[overview_df["GPUs (Avail)"] > 0]
-        
+            df = df[df["GPUs (Avail)"] > 0]
         # hide columns for simplicity
-        overview_df = overview_df.drop(columns=["GPUs (Total)", "GPUs (Avail)"])
-        
-        if sort_column is not None:
-            overview_df = overview_df.sort_values(overview_df.columns[sort_column],ascending=sort_ascending)
-        return overview_df
+        return df.drop(columns=["GPUs (Total)", "GPUs (Avail)"])
 
-    @handle_error
-    def query_history(self, sort_column=None, sort_ascending=True):
-        starttime = self.get_history_starttime()
-        sacct_df = self.get_sacct(starttime=starttime)
-        if sort_column is not None:
-            sacct_df = sacct_df.sort_values(sacct_df.columns[sort_column], ascending=sort_ascending)
-        
-        self.stats['nhistory'] = len(sacct_df)
-
+    def query_history(self):
+        df = self.get_sacct()
+        self.stats['nhistory'] = len(df)
         if self.only_completed_history:
-            sacct_df = sacct_df[sacct_df["State"] == "COMPLETED"]
+            df = df[df["State"] == "COMPLETED"]
+        self.stats['nhistory_completed'] = len(df)
+        return df
 
-        self.stats['nhistory_completed'] = len(sacct_df)
-        return sacct_df
+    def get_squeue(self):
+        fields = [
+            "JOBID:18",
+            "USERNAME:10",
+            "PRIORITY:8",
+            "PARTITION:80",
+            "NAME:200",
+            "STATE:8",
+            "TimeUsed:10",
+            "StartTime:30",
+            "TimeLimit:15",
+            "tres-alloc:100",
+            "ReasonList:100",
+        ]
+        cmd = ["squeue", f"--Format={'|,'.join(fields)}", "-S", "T"]
+        if self.only_my_jobs:
+            cmd.append("--me")
+        if self.only_running_jobs:
+            cmd.append("--state=RUNNING")
+        df = pd.read_csv(io.StringIO(re.sub(' +', '', self._run(cmd))), sep="|")
 
-    @handle_error
-    def get_history_starttime(self):
-        if self.history_range == "1 week":
-            return (datetime.now() - timedelta(weeks=1)).strftime('%Y-%m-%d')
-        elif self.history_range == "1 month":
-            return (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-        elif self.history_range == "4 months":
-            return (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
-        elif self.history_range == "1 year":
-            return (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-        else:
-            return "2024-11-26"
-    
-    @handle_error
-    def get_squeue(self, only_my_jobs=True, only_running_jobs=False):
-        sep = "|"
-        if DEBUG:
-            response_string = SQUEUE_DEBUG
-        else:
-            args = f"{sep},".join([
-                "JOBID:18",
-                "USERNAME:10",
-                "PRIORITY:8",
-                "PARTITION:80",
-                "NAME:200",
-                "STATE:8",
-                "TimeUsed:10",
-                "StartTime:30",
-                "TimeLimit:15",
-                "tres-alloc:100",
-                "ReasonList:100",
-            ])
-            query_string = f"""squeue --Format="{args}" -S T"""
-            if self.verbose:
-                self.info_log.write(query_string)
+        if not df.empty:
+            # right align time
+            df["TIME"] = df["TIME"].str.rjust(df["TIME"].str.len().max())
+            df["START_TIME"] = df["START_TIME"].map(simplify_start_time)
+        return df
 
-            if only_my_jobs:
-                query_string += " --me"
-            if only_running_jobs:
-                query_string += " --state=RUNNING"
-            response_string = subprocess.check_output(query_string, shell=True).decode("utf-8")
-        compact_string = re.sub(' +', '', response_string)
-        data = io.StringIO(compact_string)
-        df = pd.read_csv(data, sep=sep)
-
-        # right align time
-        max_length = df["TIME"].str.len().max()
-        df.loc[:, "TIME"] = df.loc[:, "TIME"].apply(lambda x: f"{x:>{max_length}}")
-        
-        # remove years from start time
-        df.loc[:, "START_TIME"] = df.loc[:, "START_TIME"].apply(lambda x: simplify_start_time(x))
-        
-        # simplify tres
-        # df.loc[:, "TRES_ALLOC"] = df.loc[:, "TRES_ALLOC"].apply(simplify_tres)
-        return df 
-    
-    @handle_error
     def get_sinfo(self):
-        if DEBUG:
-            response_string = SINFO_DEBUG
-        else:
-            args = f",".join([
-                "Partition:25",
-                "NodeHost",
-                "Gres:500",
-                "GresUsed:500",
-                "StateCompact",
-                "FreeMem",
-                "Memory",
-                "CPUsState",
-                "Features:200"
-            ])
-            query_string = f"""sinfo -O {args}"""
-            if self.verbose:
-                self.info_log.write(query_string)
+        fields = [
+            "Partition:25",
+            "NodeHost",
+            "Gres:500",
+            "GresUsed:500",
+            "StateCompact",
+            "FreeMem",
+            "Memory",
+            "CPUsState",
+            "Features:200",
+        ]
+        output = self._run(["sinfo", "-O", ",".join(fields)])
+        df = pd.read_csv(io.StringIO(re.sub(' +', ' ', output)), sep=" ")
 
-            response_string = subprocess.check_output(query_string, shell=True).decode("utf-8")
-
-        formatted_string = re.sub(' +', ' ', response_string)
-        data = io.StringIO(formatted_string)
-        df = pd.read_csv(data, sep=" ")
-        overview_df = []
-        for row in df.iterrows():
-            # overview_df = overview_df[['Partition', 'Host', "Device", "State", "Mem (GB)", "CPUs", "GPUs", "Free IDX", "Feature"]]
-
-            if row[1]['GRES'] != "(null)":
-                device, ngpus = self.parse_gres(row[1]['GRES'])
-            else:
+        records = []
+        for _, row in df.iterrows():
+            if row['GRES'] == "(null)":
                 continue
-            
-            node_available = row[1]["STATE"] in ["mix", "idle", "alloc"]
-            if not node_available:
-                gpu_avail_idx = []
-            else:
-                device, gpu_avail_idx = self.parse_gres_used(row[1]['GRES_USED'], ngpus)
-            ngpus_avail = len(gpu_avail_idx)
+            device, ngpus = parse_gres(row['GRES'])
+            gpu_avail_idx = parse_gres_used(row['GRES_USED'], ngpus) if row["STATE"] in ["mix", "idle", "alloc"] else []
+            _, ncpus_avail, _, ncpus_total = row["CPUS(A/I/O/T)"].split("/")
 
-            host_info = OrderedDict()
+            host_info = {
+                'Partition': str(row["PARTITION"]),
+                'Host': str(row["HOSTNAMES"]),
+                'Device': device,
+                'State': str(row["STATE"]),
+                'Mem (GB)': f"{mem_gb(row['FREE_MEM'])}/{mem_gb(row['MEMORY'])}",
+                'CPUs': f"{ncpus_avail}/{ncpus_total}",
+                'GPUs (Total)': ngpus,
+                'GPUs (Avail)': len(gpu_avail_idx),
+                'GPUs': f"{len(gpu_avail_idx)}/{ngpus}",
+                'GPUs (Avail IDX)': f"[{','.join(map(str, gpu_avail_idx))}]",
+            }
 
-            host_info['Partition'] = str(row[1]["PARTITION"])
-            host_info['Host'] = str(row[1]["HOSTNAMES"])
-            host_info['Device'] = device
-            host_info['State'] = str(row[1]["STATE"])
-
-            try:
-                mem_avail = int(row[1]["FREE_MEM"]) // 1024
-            except:
-                mem_avail = row[1]["FREE_MEM"]
-            # host_info['Mem (Avail)'] = mem_avail
-            try:
-                mem_total = int(row[1]["MEMORY"]) // 1024
-            except:
-                mem_total = row[1]["MEMORY"]
-            # host_info['Mem (Total)'] = mem_total
-            host_info['Mem (GB)'] = f"{mem_avail}/{mem_total}"
-
-            cpu_info = row[1]["CPUS(A/I/O/T)"].split("/")
-            ncpus_avail = cpu_info[1]
-            ncpus_total = cpu_info[3]
-            # host_info['CPUs (Avail)'] = ncpus_avail
-            # host_info['CPUs (Total)'] = ncpus_total
-            host_info['CPUs'] = f"{ncpus_avail}/{ncpus_total}"
-
-            host_info['GPUs (Total)'] = ngpus
-            host_info['GPUs (Avail)'] = ngpus_avail
-            host_info["GPUs"] = f"{host_info['GPUs (Avail)']}/{ngpus}"
-            host_info['GPUs (Avail IDX)'] = f"[{','.join(str(idx) for idx in gpu_avail_idx)}]"
-
-            features = row[1]["AVAIL_FEATURES"]
-            if ',' in features:
-                unnamed_features = []
-                for feature in features.split(","):
-                    if ':' in feature:
-                        name, value = feature.split(':')
-                        host_info[name] = value
-                    else:
-                        unnamed_features.append(feature)
-            else:
-                unnamed_features = [features]
+            # named features ("name:value") get their own column
+            unnamed_features = []
+            for feature in str(row["AVAIL_FEATURES"]).split(","):
+                name, sep, value = feature.partition(':')
+                if sep:
+                    host_info[name] = value
+                else:
+                    unnamed_features.append(feature)
             host_info['Feature'] = ','.join(unnamed_features)
 
-            overview_df.append(host_info)
-        overview_df = pd.DataFrame.from_records(overview_df).drop_duplicates("Host")
-        return overview_df
-    
-    @handle_error
-    def parse_gres(self, gres_str):
-        match = re.match(r"([^:]+)(?::([^:()]+))?:([^:(,]+)(?:\(S:([^)]+)\))?", gres_str)
+            records.append(host_info)
+        return pd.DataFrame.from_records(records).drop_duplicates("Host")
 
-        if match:
-            groups = match.groups()
-            if self.verbose:
-                self.info_log.write(f"Parsed gres: {groups} from {gres_str}")
-            _, device, ngpus, _ = groups
-            ngpus = int(ngpus)
-        else:
-            error_msg = f"Error parsing gres: {gres_str}"
-            raise ValueError(error_msg)
-
-        return device, ngpus
-
-    @handle_error
-    def parse_gres_used(self, gres_used_str, num_total):
-        match = re.match(r"([^:]+)(?::([^:]+))?:([^:(,]+)(?:\(IDX:([^)]+)\))?", gres_used_str)
-        if match:
-            groups = match.groups()
-            if self.verbose:
-                self.info_log.write(f"Parsed gres_used: {groups} from {gres_used_str}")
-            _, device, ngpus_used, alloc_str = groups
-            ngpus_used = int(ngpus_used)
-        else:
-            error_msg = f"Error parsing gres_used: {gres_used_str}"
-            raise ValueError(error_msg)
-
-        gpu_used_idx = []
-        if alloc_str:
-            for gpu_ids in alloc_str.split(","):
-                if "-" in gpu_ids:
-                    start, end = gpu_ids.split("-")
-                    for i in range(int(start), int(end)+1):
-                        gpu_used_idx.append(i)
-                else:
-                    if gpu_ids == "N/A":
-                        pass
-                    else:
-                        gpu_used_idx.append(int(gpu_ids))
-            assert ngpus_used == len(gpu_used_idx), f"Number of used GPUs {ngpus_used} does not match parsed indices {gpu_used_idx} in gres_used: {gres_used_str}"
-
-        gpu_avail_idx = [idx for idx in range(num_total) if idx not in gpu_used_idx]
-        return device, gpu_avail_idx
-
-    @handle_error
-    def get_sacct(self, starttime="2024-11-26", endtime="now"):
-        args = f",".join([
-            "JobID",
-            "JobName",
-            "State",
-            "Start",
-            "Elapsed",
-            "NodeList",
-            "AllocTRES",
-            "Partition",
-            "StdOut"
-        ])
-        query_string = f"""sacct --format={args} -P -X --starttime={starttime} --endtime={endtime}"""
-        if self.verbose:
-            self.info_log.write(query_string)
-
-        response_string = subprocess.check_output(
-            query_string,
-            shell=True
-        ).decode("utf-8")
-        data = io.StringIO(response_string)
-        df = pd.read_csv(data, sep='|')
-
-        # Strip whitespace from column names
+    def get_sacct(self, endtime="now"):
+        days = HISTORY_RANGES.get(self.history_range)
+        starttime = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d') if days else "2024-11-26"
+        fields = "JobID,JobName,State,Start,Elapsed,NodeList,AllocTRES,Partition,StdOut"
+        output = self._run(["sacct", f"--format={fields}", "-P", "-X", f"--starttime={starttime}", f"--endtime={endtime}"])
+        df = pd.read_csv(io.StringIO(output), sep='|')
         df.columns = df.columns.str.strip()
-
-        # Strip whitespace from each string element in the DataFrame
         for col in df.select_dtypes(['object']).columns:
             df[col] = df[col].str.strip()
         return df
 
-def perform_scancel(job_id):
-    os.system(f"""scancel {job_id}""")
 
-def remove_first_line(input_string):
-    lines = input_string.split('\n')
-    return '\n'.join(lines[1:])
+def parse_gres(gres_str):
+    match = re.match(r"([^:]+)(?::([^:()]+))?:([^:(,]+)(?:\(S:([^)]+)\))?", gres_str)
+    if not match:
+        raise ValueError(f"Error parsing gres: {gres_str}")
+    _, device, ngpus, _ = match.groups()
+    return device, int(ngpus)
+
+def parse_gres_used(gres_used_str, num_total):
+    """Return the indices of the GPUs that are not in use."""
+    match = re.match(r"([^:]+)(?::([^:]+))?:([^:(,]+)(?:\(IDX:([^)]+)\))?", gres_used_str)
+    if not match:
+        raise ValueError(f"Error parsing gres_used: {gres_used_str}")
+    _, _, ngpus_used, alloc_str = match.groups()
+
+    gpu_used_idx = set()
+    if alloc_str:
+        for gpu_ids in alloc_str.split(","):
+            if gpu_ids == "N/A":
+                continue
+            start, _, end = gpu_ids.partition("-")
+            gpu_used_idx.update(range(int(start), int(end or start) + 1))
+        assert int(ngpus_used) == len(gpu_used_idx), f"Number of used GPUs {ngpus_used} does not match parsed indices {gpu_used_idx} in gres_used: {gres_used_str}"
+
+    return [idx for idx in range(num_total) if idx not in gpu_used_idx]
+
+def mem_gb(mem_mb):
+    try:
+        return int(mem_mb) // 1024
+    except (TypeError, ValueError):
+        return mem_mb
 
 def simplify_start_time(start_time):
+    """Remove the year from a start time"""
     try:
-        if start_time != "nan":
-            start_time = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S").strftime("%m-%d %H:%M")
-    except Exception as e:
-        pass
-    return start_time
-
-def simplify_tres(tres):
-    tres_ = []
-    for x in str(tres).split(","):
-        if 'billing=' in x:
-            continue
-        tres_.append(x)
-    return ",".join(tres_)
-
-def read_log(fn, num_lines=100):
-    with open(os.path.expanduser(fn), 'r') as f:
-        txt_lines = list(f.readlines()[-num_lines:])
-    
-    return txt_lines
+        return datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%S").strftime("%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return start_time
 
 def run_ui(verbose=False, interval=10, history_range="1 week"):
-    # if debug:
-    #     # global for quick debugging
-    #     global DEBUG
-    #     DEBUG = True
     app = Slurman()
     app.verbose = verbose
     app.interval = interval
